@@ -100,6 +100,27 @@ node tools/evejs-character-import/evejs-character-import.js import \
 `--native` is an alias for `--host-only`.  
 Typical native layout: `_local/gameStore/data` (sqlite is `_local/gameStore/gamestore.sqlite`).
 
+If you pass `--target …/_local/gameStore` (store root), the tool normalizes to
+`…/_local/gameStore/data` automatically.
+
+### Native Node.js ABI (`better-sqlite3`)
+
+Host import loads EveJS’s `server/node_modules/better-sqlite3`. That native
+addon must match the **same Node major** you use to run `import`.
+
+Example error: `NODE_MODULE_VERSION 137` vs `147` (Node 24 vs Node 26).
+
+Fix (from the EveJS install):
+
+```bash
+node -p "process.version + ' modules=' + process.versions.modules"
+cd /path/to/evejs/server
+npm rebuild better-sqlite3
+# or: rm -rf node_modules && npm ci
+```
+
+Prefer using the same Node the server was installed/started with (nvm/fnm help).
+
 ### Docker install
 
 ```bash
@@ -133,6 +154,7 @@ On EveJS 0.12.5+, faces live in the Docker volume under
 | Issue | Fix |
 |-------|-----|
 | Native install but Docker volume used | Pass `--host-only` / `--native` or `--target …/_local/gameStore/data` |
+| `NODE_MODULE_VERSION` / better-sqlite3 | Same Node as the server; `cd server && npm rebuild better-sqlite3` |
 | Wrong volume / empty characters | Pass `--volume` / `--image` for Docker, or `--target` for host |
 | Import while server running | Stop the server first (compose or native) |
 | Blank faces after upgrade | `restore-portraits` |

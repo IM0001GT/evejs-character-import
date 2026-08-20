@@ -1,6 +1,6 @@
 # EveJS Character Import
 
-**v1.1.2**
+**v1.1.3**
 
 Load a **personal character data export** (standard ESI dump folder layout) into
 a local **EveJS** gameStore for private practice.

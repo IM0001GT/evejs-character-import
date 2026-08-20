@@ -28,7 +28,7 @@ const {
 
 function printHelp() {
   console.log(`
-EveJS Character Import  v1.1.2
+EveJS Character Import  v1.1.3
 ==============================
 
 Convert a personal character *data export* folder into an EveJS players-bundle
@@ -490,13 +490,44 @@ function listHostGameStoreDataDirs() {
   return candidates;
 }
 
+/**
+ * Normalize a user --target path to the EveJS *data* dir.
+ *
+ * Accepts either:
+ *   .../_local/gameStore/data     (correct)
+ *   .../_local/gameStore          (store root; common mistake)
+ *   .../_local/gameStore/gamestore.sqlite
+ */
+function normalizeHostDataDir(inputPath) {
+  let abs = path.resolve(inputPath);
+  const base = path.basename(abs);
+
+  if (base === "gamestore.sqlite" || base.endsWith(".sqlite")) {
+    // .../gameStore/gamestore.sqlite -> .../gameStore/data
+    abs = path.join(path.dirname(abs), "data");
+  } else if (base === "gameStore" || base === "newDatabase") {
+    // .../_local/gameStore -> .../_local/gameStore/data
+    abs = path.join(abs, "data");
+  } else if (
+    fs.existsSync(path.join(abs, "gamestore.sqlite")) &&
+    !fs.existsSync(path.join(abs, "itemTypes"))
+  ) {
+    // User pointed at store root that already contains sqlite beside data/
+    abs = path.join(abs, "data");
+  }
+
+  return abs;
+}
+
 function resolveHostImportTarget(args = {}) {
   if (args.target) {
-    const abs = path.resolve(args.target);
+    const dataDir = normalizeHostDataDir(args.target);
+    const storeRoot = path.resolve(dataDir, "..");
     return {
-      dataDir: abs,
-      sqlitePath: path.resolve(abs, "..", "gamestore.sqlite"),
+      dataDir,
+      sqlitePath: path.join(storeRoot, "gamestore.sqlite"),
       label: "manual --target",
+      normalizedFrom: path.resolve(args.target) !== dataDir ? path.resolve(args.target) : null,
     };
   }
   const hosts = listHostGameStoreDataDirs();
@@ -511,6 +542,26 @@ function resolveHostImportTarget(args = {}) {
     };
   }
   return hosts[0];
+}
+
+function formatBetterSqlite3AbiHint(errorText) {
+  const text = String(errorText || "");
+  if (!/NODE_MODULE_VERSION|better_sqlite3|better-sqlite3/i.test(text)) {
+    return null;
+  }
+  return (
+    "\nNative module ABI mismatch (better-sqlite3).\n" +
+      "The Node.js you used to run *import* is not the same ABI as the one that\n" +
+      "built server/node_modules/better-sqlite3.\n\n" +
+      "  MODULE 137 ≈ Node.js 24.x\n" +
+      "  MODULE 147 ≈ Node.js 26.x\n\n" +
+      "Fix (pick one):\n" +
+      "  1) Use the same Node major the EveJS server uses, then re-run import.\n" +
+      "     Check with:  node -p \"process.versions\"   (look at node + modules)\n" +
+      "  2) Rebuild native modules for *this* Node, from the EveJS install:\n" +
+      "       cd /path/to/evejs/server && npm rebuild better-sqlite3\n" +
+      "     (or: cd server && rm -rf node_modules && npm ci)\n"
+  );
 }
 
 /**
@@ -815,6 +866,11 @@ async function cmdImport(args) {
   console.log(`  mode: native/host`);
   console.log(`  target: ${host.dataDir}  (${host.label})`);
   console.log(`  sqlite: ${host.sqlitePath}`);
+  if (host.normalizedFrom) {
+    console.log(
+      `  note: normalized --target from ${host.normalizedFrom} → ${host.dataDir}`,
+    );
+  }
   if (host.missing) {
     console.warn(
       "  Warning: that data dir does not exist yet; importPlayers may create an empty store.\n" +
@@ -831,15 +887,23 @@ async function cmdImport(args) {
   }
 
   // Run from server/ so better-sqlite3 resolves correctly.
+  // Capture output so we can add a clear ABI rebuild hint on failure.
   const result = spawnSync(process.execPath, nodeArgs, {
     cwd: path.join(REPO_ROOT, "server"),
-    stdio: "inherit",
+    encoding: "utf8",
     env: {
       ...process.env,
       EVEJS_GAMESTORE_DATA_DIR: host.dataDir,
     },
   });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
   if (result.status !== 0) {
+    const combined = `${result.stdout || ""}\n${result.stderr || ""}\n${result.error || ""}`;
+    const hint = formatBetterSqlite3AbiHint(combined);
+    if (hint) {
+      console.error(hint);
+    }
     process.exitCode = result.status || 1;
     return;
   }

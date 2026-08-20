@@ -2,7 +2,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-VERSION="${EVEJS_CHARACTER_IMPORT_VERSION:-1.1.2}"
+VERSION="${EVEJS_CHARACTER_IMPORT_VERSION:-1.1.3}"
 NAME="evejs-character-import-v${VERSION}"
 DIST="${REPO_ROOT}/dist"
 STAGE="${DIST}/.stage-${NAME}"

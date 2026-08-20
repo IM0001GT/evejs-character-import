@@ -1,0 +1,9 @@
+EveJS Character Import
+======================
+
+1. Place at: <evejs-install>/tools/evejs-character-import/
+2. Read GUIDE.md
+3. package --export-dir /path/to/character-export-folder
+4. import --bundle path/to/players-bundle.json  (server stopped)
+
+Does not perform ESI SSO. Bring your own character data export folder.

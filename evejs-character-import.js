@@ -809,6 +809,21 @@ async function cmdImport(args) {
     stopComposeServices(REPO_ROOT);
 
     const containerBundle = "/tq-import-bundle.json";
+    const containerLib = "/tq-import-lib";
+    const importArgs = ["--target", docker.dataDir];
+    if (args.onConflict) {
+      importArgs.push("--on-conflict", args.onConflict);
+    }
+    if (args.dryRun) {
+      importArgs.push("--dry-run");
+    }
+    // A real import first reserves saved-fitting IDs from the target's
+    // _meta.nextFittingID and re-numbers a container-local copy of the bundle
+    // (lib/fittingIds.js); importPlayers.js then reads that copy.
+    const script = args.dryRun
+      ? 'exec node src/gameStore/importPlayers.js --in "$0" "$@"'
+      : `node ${containerLib}/fittingIds.js reserve "$0" /tmp/tq-import-bundle.json && ` +
+        'exec node src/gameStore/importPlayers.js --in /tmp/tq-import-bundle.json "$@"';
     const dockerArgs = [
       "run",
       "--rm",
@@ -818,24 +833,19 @@ async function cmdImport(args) {
       `${docker.volume}:/var/lib/evejs`,
       "-v",
       `${bundlePath}:${containerBundle}:ro`,
+      "-v",
+      `${path.join(__dirname, "lib")}:${containerLib}:ro`,
       "-e",
       `EVEJS_GAMESTORE_DATA_DIR=${docker.dataDir}`,
       "-w",
       "/app/server",
       docker.image,
-      "node",
-      "src/gameStore/importPlayers.js",
-      "--in",
+      "sh",
+      "-c",
+      script,
       containerBundle,
-      "--target",
-      docker.dataDir,
+      ...importArgs,
     ];
-    if (args.onConflict) {
-      dockerArgs.push("--on-conflict", args.onConflict);
-    }
-    if (args.dryRun) {
-      dockerArgs.push("--dry-run");
-    }
 
     const result = spawnSync("docker", dockerArgs, {
       cwd: REPO_ROOT,
@@ -863,6 +873,8 @@ async function cmdImport(args) {
   }
 
   const host = backend.host || resolveHostImportTarget(args);
+  const serverDir = path.join(REPO_ROOT, "server");
+  const hostEnv = { ...process.env, EVEJS_GAMESTORE_DATA_DIR: host.dataDir };
   console.log(`  mode: native/host`);
   console.log(`  target: ${host.dataDir}  (${host.label})`);
   console.log(`  sqlite: ${host.sqlitePath}`);
@@ -878,7 +890,31 @@ async function cmdImport(args) {
     );
   }
 
-  const nodeArgs = [importScript, "--in", bundlePath, "--target", host.dataDir];
+  let importBundlePath = bundlePath;
+  if (!args.dryRun) {
+    // Reserve saved-fitting IDs from the target first (see lib/fittingIds.js).
+    importBundlePath = path.join(
+      require("os").tmpdir(),
+      `tq-import-bundle-${process.pid}.json`,
+    );
+    const reserve = spawnSync(
+      process.execPath,
+      [path.join(__dirname, "lib", "fittingIds.js"), "reserve", bundlePath, importBundlePath],
+      { cwd: serverDir, encoding: "utf8", env: hostEnv },
+    );
+    if (reserve.stdout) process.stdout.write(reserve.stdout);
+    if (reserve.stderr) process.stderr.write(reserve.stderr);
+    if (reserve.status !== 0) {
+      const combined = `${reserve.stdout || ""}\n${reserve.stderr || ""}\n${reserve.error || ""}`;
+      const hint = formatBetterSqlite3AbiHint(combined);
+      if (hint) console.error(hint);
+      fs.rmSync(importBundlePath, { force: true });
+      process.exitCode = reserve.status || 1;
+      return;
+    }
+  }
+
+  const nodeArgs = [importScript, "--in", importBundlePath, "--target", host.dataDir];
   if (args.onConflict) {
     nodeArgs.push("--on-conflict", args.onConflict);
   }
@@ -889,13 +925,13 @@ async function cmdImport(args) {
   // Run from server/ so better-sqlite3 resolves correctly.
   // Capture output so we can add a clear ABI rebuild hint on failure.
   const result = spawnSync(process.execPath, nodeArgs, {
-    cwd: path.join(REPO_ROOT, "server"),
+    cwd: serverDir,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      EVEJS_GAMESTORE_DATA_DIR: host.dataDir,
-    },
+    env: hostEnv,
   });
+  if (importBundlePath !== bundlePath) {
+    fs.rmSync(importBundlePath, { force: true });
+  }
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   if (result.status !== 0) {

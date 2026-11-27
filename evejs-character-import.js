@@ -45,6 +45,7 @@ Commands:
   import                Load a bundle into a STOPPED EveJS gameStore
   portraits             Download face JPEGs for imported characters
   restore-portraits     Re-sync faces after a server upgrade
+  import-appearance     Copy paper dolls out of an EVE client cache into the DB
   repair-fittings       Fix already-imported fitted modules/charges in live DB
   help
 
@@ -64,12 +65,18 @@ Options:
   --dry-run
   --sync-only           restore-portraits: host JPGs to volume only
   --force-download      restore-portraits: re-download faces
+  --cache-dir <path>    import-appearance: EVE client cache dir to read
+  --all-caches          import-appearance: include non-Tranquility cache trees
+  --list                import-appearance: show cached dolls, write nothing
+  --map <local>=<src>   import-appearance: pair one character by hand (repeatable)
+  --overwrite           import-appearance: replace an existing stored doll
   --no-interactive      Do not prompt when multiple Docker volumes exist
 
 Examples:
   node tools/evejs-character-import/evejs-character-import.js package --export-dir /path/to/export-folder
   node tools/evejs-character-import/evejs-character-import.js import --bundle path/to/players-bundle.json
   node tools/evejs-character-import/evejs-character-import.js restore-portraits
+  node tools/evejs-character-import/evejs-character-import.js import-appearance --list
 `);
 }
 
@@ -93,6 +100,11 @@ function parseArgs(argv) {
     syncOnly: false,
     forceDownload: false,
     withEvejsImport: false,
+    cacheDir: null,
+    allCaches: false,
+    list: false,
+    overwrite: false,
+    map: [],
     typesJson: null,
     typeData: null,
     help: false,
@@ -147,6 +159,30 @@ function parseArgs(argv) {
       case "--force-download":
         args.forceDownload = true;
         break;
+      case "--cache-dir":
+        args.cacheDir = next();
+        break;
+      case "--all-caches":
+        args.allCaches = true;
+        break;
+      case "--list":
+        args.list = true;
+        break;
+      case "--overwrite":
+        args.overwrite = true;
+        break;
+      case "--map": {
+        // --map <localCharacterID>=<sourceCharacterID>
+        const pair = String(next() || "");
+        const [left, right] = pair.split("=");
+        const localCharacterID = Number(left);
+        const tqCharacterID = Number(right);
+        if (!(localCharacterID > 0) || !(tqCharacterID > 0)) {
+          throw new Error(`Invalid --map value: ${pair} (expected <localID>=<sourceID>)`);
+        }
+        args.map.push({ localCharacterID, tqCharacterID });
+        break;
+      }
       case "--with-evejs-import":
       case "--import-evejs":
         args.withEvejsImport = true;
@@ -1473,6 +1509,212 @@ process.stdout.write(String(id));
   return localChars.filter((c) => c.sourceCharacterID > 0);
 }
 
+/**
+ * Copy paper dolls (sculpts / modifiers / colors / hair) out of an EVE client's
+ * own CachedMethodCalls store into characters.appearanceInfo.
+ *
+ * The doll is not available from any web API — only the client that rendered it
+ * has a copy. Pairing works the same way portraits do: tqImport.sourceCharacterID
+ * on the local record first, then name matching against a dump or bundle, then
+ * explicit --map pairs.
+ */
+async function cmdImportAppearance(args) {
+  const {
+    buildAppearanceInfo,
+    findCachedMethodCallDirs,
+    hasRunningVolumeUsers,
+    scanCachedDolls,
+    writeAppearanceUpdates,
+  } = require("./lib/appearance");
+  const { loadMappingsFromDump, loadMappingsFromBundle, pairByName } =
+    require("./lib/portraits");
+
+  const cacheDirs = findCachedMethodCallDirs({
+    cacheDir: args.cacheDir,
+    allServers: args.allCaches,
+  });
+  if (cacheDirs.length === 0) {
+    throw new Error(
+      "No EVE client cache found.\n" +
+        "  Looked under %LOCALAPPDATA%\\CCP\\EVE\\*_tranquility and evejs-prefix.\n" +
+        "  Pass --cache-dir <path to a cache folder>, or --all-caches to include other servers.",
+    );
+  }
+  console.log(`Client cache directories: ${cacheDirs.length}`);
+  for (const entry of cacheDirs) {
+    console.log(`  ${entry.dir}`);
+  }
+
+  const { dolls, scanned } = scanCachedDolls(cacheDirs);
+  console.log(`Scanned ${scanned} cached call(s); paper dolls found: ${dolls.size}`);
+  if (dolls.size === 0) {
+    throw new Error(
+      "No GetPaperDollData replies in that cache.\n" +
+        "  The client only caches a doll it has actually rendered — log the character\n" +
+        "  in (or open its info window) on the source client once, then retry.",
+    );
+  }
+
+  // Convert everything up front so a malformed row set fails before any write.
+  const converted = new Map();
+  for (const [tqCharacterID, doll] of dolls) {
+    try {
+      converted.set(tqCharacterID, buildAppearanceInfo(doll.keyVal));
+    } catch (error) {
+      console.log(`  source=${tqCharacterID} unusable: ${error.message || error}`);
+    }
+  }
+
+  if (args.list) {
+    console.log("\nCached dolls:");
+    for (const [tqCharacterID, built] of converted) {
+      const hair =
+        built.hairDarkness === null ? "n/a" : built.hairDarkness.toFixed(3);
+      console.log(
+        `  source=${tqCharacterID}  sculpts=${built.counts.sculpts}` +
+          ` modifiers=${built.counts.modifiers} colors=${built.counts.colors} hair=${hair}`,
+      );
+    }
+    console.log("\nNothing written (--list).");
+    return converted;
+  }
+
+  let tqMappings = [];
+  if (args.dump) {
+    const dumpPath = resolveDumpPath(args.dump);
+    if (!dumpPath || !fs.existsSync(dumpPath)) {
+      throw new Error(`Dump not found: ${args.dump}`);
+    }
+    tqMappings = loadMappingsFromDump(dumpPath).mappings;
+  } else if (args.bundle) {
+    tqMappings = loadMappingsFromBundle(path.resolve(args.bundle));
+  }
+
+  const localChars = await listLocalCharacters(args);
+  const filtered = args.username
+    ? await filterCharactersByUsername(localChars, args)
+    : localChars;
+
+  const byLocalID = new Map();
+  for (const pair of pairByName(filtered, tqMappings)) {
+    byLocalID.set(pair.localCharacterID, pair);
+  }
+  // Explicit --map wins over anything inferred.
+  const localByID = new Map(filtered.map((c) => [c.characterID, c]));
+  for (const manual of args.map) {
+    const local = localByID.get(manual.localCharacterID);
+    byLocalID.set(manual.localCharacterID, {
+      localCharacterID: manual.localCharacterID,
+      tqCharacterID: manual.tqCharacterID,
+      characterName: local ? local.characterName : "(not in this store)",
+    });
+  }
+
+  const updates = [];
+  const unmatched = [];
+  for (const pair of byLocalID.values()) {
+    const built = converted.get(pair.tqCharacterID);
+    if (!built) {
+      unmatched.push(pair);
+      continue;
+    }
+    updates.push({
+      localCharacterID: pair.localCharacterID,
+      characterName: pair.characterName,
+      counts: built.counts,
+      appearanceInfo: built.appearanceInfo,
+      overwrite: Boolean(args.overwrite),
+    });
+  }
+
+  if (unmatched.length > 0) {
+    console.log(`\nNo cached doll for ${unmatched.length} local character(s):`);
+    for (const pair of unmatched) {
+      console.log(`  ${pair.characterName} local=${pair.localCharacterID}`);
+    }
+  }
+
+  if (updates.length === 0) {
+    throw new Error(
+      "Nothing to import — no local character paired with a cached doll.\n" +
+        "  Run with --list to see which source characters are cached, then pair one\n" +
+        "  explicitly: --map <localCharacterID>=<sourceCharacterID>",
+    );
+  }
+
+  console.log(`\nImporting ${updates.length} doll(s):`);
+  for (const update of updates) {
+    console.log(
+      `  ${update.characterName} local=${update.localCharacterID}` +
+        ` sculpts=${update.counts.sculpts} modifiers=${update.counts.modifiers}` +
+        ` colors=${update.counts.colors}`,
+    );
+  }
+
+  const docker = args.hostOnly ? null : await detectDockerGameStore(args);
+  if (docker && !args.dryRun) {
+    const running = hasRunningVolumeUsers(docker.volume);
+    if (running.other.length > 0) {
+      console.log(
+        `\n  Note: ${running.other.join(", ")} also mount ${docker.volume};` +
+          " they keep their own sqlite and do not need stopping.",
+      );
+    }
+    if (running.blocking.length > 0) {
+      throw new Error(
+        `The gameStore is in use by: ${running.blocking.join(", ")}\n` +
+          "  The server caches characters in memory and flushes over the file, so it\n" +
+          "  would undo this edit. Stop it first:\n" +
+          "    docker compose stop server\n" +
+          "  then re-run, and start it again with: docker compose start server",
+      );
+    }
+  }
+
+  let sqlitePath = null;
+  if (!docker) {
+    const dataDir =
+      args.target ||
+      process.env.EVEJS_GAMESTORE_DATA_DIR ||
+      path.join(REPO_ROOT, "_local", "gameStore", "data");
+    sqlitePath = path.resolve(dataDir, "..", "gamestore.sqlite");
+    if (!fs.existsSync(sqlitePath)) {
+      throw new Error(`No gamestore.sqlite found at ${sqlitePath}`);
+    }
+  }
+
+  const results = writeAppearanceUpdates({
+    docker,
+    sqlitePath,
+    updates,
+    dryRun: args.dryRun,
+  });
+
+  let applied = 0;
+  for (const result of results) {
+    if (result.ok) {
+      applied += 1;
+      if (result.replaced) {
+        console.log(`  local=${result.localCharacterID} replaced existing doll`);
+      }
+    } else {
+      console.log(`  local=${result.localCharacterID} FAILED: ${result.error}`);
+    }
+  }
+
+  console.log(
+    `\nAppearance imported: ${applied}/${results.length}${args.dryRun ? " (dry-run, nothing written)" : ""}`,
+  );
+  if (!args.dryRun && applied > 0) {
+    console.log("Start the server again, then relog the character to see the doll.");
+    console.log(
+      "Note: re-customising in the creator makes the client upload its own portrait,\n" +
+        "  which overwrites imported JPEGs — re-run restore-portraits --force-download after.",
+    );
+  }
+  return results;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help || !args.command) {
@@ -1501,6 +1743,11 @@ async function main() {
     case "restore-portrait":
     case "portraits-restore":
       await cmdRestorePortraits(args);
+      break;
+    case "import-appearance":
+    case "appearance":
+    case "import-doll":
+      await cmdImportAppearance(args);
       break;
     case "repair-fittings":
     case "repair-fitting":

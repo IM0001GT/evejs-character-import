@@ -51,7 +51,43 @@ git clone https://github.com/IM0001GT/evejs-character-import.git tools/evejs-cha
 ## Commands
 
 ```text
-package | import | portraits | restore-portraits | help
+package | import | portraits | restore-portraits | import-appearance | help
 ```
 
-(`convert` / `--dump` remain as aliases.)
+(`convert` / `--dump` remain as aliases; so are `appearance` / `import-doll`.)
+
+## Appearance (paper doll)
+
+`portraits` gives a character its face as a 2D JPEG. `import-appearance` gives it
+the underlying doll — sculpts, modifiers, colors, hair — so re-customisation and
+the in-station avatar match too.
+
+No web API serves doll data. The source is the EVE client's own method-call
+cache: every `paperDollServer.GetPaperDollData` reply it receives is kept under
+`<client cache>/MachoNet/<address>/<version>/CachedMethodCalls/`, and this
+command decodes those files and rewrites them into `characters.appearanceInfo`.
+
+```bash
+# See which dolls the local client has cached (writes nothing)
+node tools/evejs-character-import/evejs-character-import.js import-appearance --list
+
+# Import for characters already imported (server STOPPED)
+docker compose stop server
+node tools/evejs-character-import/evejs-character-import.js import-appearance
+docker compose start server
+```
+
+Pairing follows the same order as portraits: `tqImport.sourceCharacterID` on the
+local record, then `--dump` / `--bundle` name matching, then explicit
+`--map <localCharacterID>=<sourceCharacterID>`.
+
+Caveats:
+
+- Only characters the client has actually rendered are in its cache. Log the
+  character in once on the source client if it is missing from `--list`.
+- `paperdollResourceID` refers to client resources. A doll cached from a newer
+  client than this server targets can reference a hairstyle or garment the local
+  client has no resource for.
+- Re-customising in the creator makes the client upload its own rendered
+  portrait, overwriting imported JPEGs. Re-run
+  `restore-portraits --force-download` afterwards.

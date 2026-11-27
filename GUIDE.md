@@ -11,7 +11,7 @@ This tool does not connect to Tranquility and does not run ESI SSO.
 
 Packaging reads EveJS `itemTypes/data.json` so it can:
 
-- write fitted modules (flags **11–132**, matching EveJS `buildMovedItemState`) with `moduleState.online = true`
+- write fitted modules, subsystems and structure modules (categories **7, 32, 66** in flags **11–132**, matching EveJS `buildMovedItemState`) with `moduleState.online = true`; drones and fighters in their bays stay plain stacks
 - write category **8** charges/crystals/scripts/ammo as **stacks** (never singleton + `moduleState`)
 
 Without that table, packaging **fails** rather than emitting a broken bundle.
@@ -25,6 +25,31 @@ node tools/evejs-character-import/evejs-character-import.js repair-fittings
 ```
 
 Or re-`package` and re-`import`.
+
+## Record shapes (EveJS 261125.x shared schema)
+
+From 261125.x the save is typed tables: a record with a field the schema does
+not declare is refused, and a field in the wrong format (an ISO date where a
+FILETIME is expected) is refused too. Packages written by this version follow
+the shapes the server itself writes:
+
+| Table | Written as |
+|-------|------------|
+| `accounts` | `passwordhash`, `isGM`, `banned` only (provenance is on each character's `tqImport`) |
+| `characters` | respec dates as FILETIME strings; jump-clone and active implants as `{ typeID }` |
+| `items` | inventory fields only; no `tq` or `blueprint` block |
+| `skillQueues` | `{ queue: [{ typeID, toLevel }], active: false, … }`, imported **paused** |
+| `lpWallets` | flat `{ corporationID: lp }` |
+| `savedFittings` | `{ ownerID, scope, fittings: { id: { …, fitData: [[typeID, flagID, qty]] } } }` |
+
+Fitting IDs are global in a store, so `import` first reserves IDs from the
+target's `savedFittings` `_meta.nextFittingID`, advances it, and re-numbers the
+package's fittings into that range before running `importPlayers.js`. Running
+`importPlayers.js` on a package by hand skips that step.
+
+Blueprint ME/TE/runs are kept in the package (`blueprintResearch`, by original
+item ID) but are not imported: EveJS keeps them in `industryBlueprintState`,
+keyed by the new item IDs that `importPlayers.js` assigns.
 
 ## Expected export layout
 
@@ -149,6 +174,28 @@ node tools/evejs-character-import/evejs-character-import.js restore-portraits --
 On EveJS 0.12.5+, faces live in the Docker volume under
 `gameStore/images/Character/`.
 
+## Appearance (paper doll)
+
+Portraits are the 2D face. The doll behind it — sculpts, modifiers, colors, hair
+— comes from the EVE client's own cached `GetPaperDollData` replies, since no web
+API exposes it.
+
+```bash
+# What the client has cached, no writes
+node tools/evejs-character-import/evejs-character-import.js import-appearance --list
+
+# Import (the server must be stopped: it flushes its in-memory characters
+# over the file and would undo the edit)
+docker compose stop server
+node tools/evejs-character-import/evejs-character-import.js import-appearance
+docker compose start server
+```
+
+The command refuses to write while a server container has the gameStore volume
+mounted. `--dry-run` shows the plan, `--overwrite` replaces a doll that is
+already stored, `--map <localCharacterID>=<sourceCharacterID>` pairs by hand, and
+`--cache-dir` points at a cache tree the auto-scan misses.
+
 ## Troubleshooting
 
 | Issue | Fix |
@@ -158,3 +205,5 @@ On EveJS 0.12.5+, faces live in the Docker volume under
 | Wrong volume / empty characters | Pass `--volume` / `--image` for Docker, or `--target` for host |
 | Import while server running | Stop the server first (compose or native) |
 | Blank faces after upgrade | `restore-portraits` |
+| No dolls found in cache | Log the character in once on the source client, then re-run `import-appearance --list` |
+| Doll imported but avatar looks wrong | Client resource drift — the source client is newer than the build this server targets |
